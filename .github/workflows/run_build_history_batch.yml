@@ -1,0 +1,113 @@
+name: Build History (Resume-Capable)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_max_minutes:
+        description: "Python runtime budget (minutes) (<=320 recommended)"
+        required: false
+        default: "320"
+      upload_buffer_min:
+        description: "Minutes reserved for uploads"
+        required: false
+        default: "25"
+      include_etf:
+        description: "1 to include ETFs"
+        required: false
+        default: "1"
+      include_index:
+        description: "1 to include indices"
+        required: false
+        default: "0"
+      history_target_date:
+        description: "YYYY-MM-DD (optional)"
+        required: false
+        default: ""
+
+jobs:
+  build-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    env:
+      TZ: Asia/Kolkata
+
+    steps:
+      - name: Checkout PUBLIC runner repo
+        uses: actions/checkout@v4
+
+      - name: Checkout PRIVATE code repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: private_repo
+          fetch-depth: 1
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install rclone
+        run: curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone (Drive)
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << 'RCLONE_EOF'
+          ${{ secrets.RCLONE_CONFIG }}
+          RCLONE_EOF
+
+      - name: Install dependencies (private repo requirements)
+        run: |
+          python -m pip install --upgrade pip >/dev/null
+          pip install -r private_repo/requirements.txt -q
+
+      - name: Resolve YEAR (IST)
+        run: |
+          YEAR=$(TZ='Asia/Kolkata' date +'%Y')
+          echo "YEAR=$YEAR" >> $GITHUB_ENV
+          echo "YEAR=$YEAR"
+
+      - name: Create data dir (inside private repo)
+        run: mkdir -p private_repo/data
+
+      - name: Download existing DBs (resume)
+        run: |
+          # Minimal logs
+          for year in $(seq 1995 ${{ env.YEAR }}); do
+            rclone copy "gdrive:market_db/market_${year}.db" private_repo/data/ \
+              --drive-acknowledge-abuse \
+              --quiet 2>/dev/null || true
+          done
+
+      - name: Marker (upload only modified DBs)
+        run: |
+          touch .marker_build_history
+
+      - name: Run build_history.py (quiet-ish)
+        env:
+          BUILD_MAX_MINUTES: ${{ inputs.build_max_minutes }}
+          BUILD_UPLOAD_BUFFER_MIN: ${{ inputs.upload_buffer_min }}
+          HISTORY_INCLUDE_ETF: ${{ inputs.include_etf }}
+          HISTORY_INCLUDE_INDEX: ${{ inputs.include_index }}
+          HISTORY_TARGET_DATE: ${{ inputs.history_target_date }}
+        working-directory: private_repo
+        run: |
+          set -euo pipefail
+          python scripts/build_history.py > ../build_history.log 2>&1 || (tail -n 200 ../build_history.log && exit 1)
+          tail -n 80 ../build_history.log
+
+      - name: Upload modified DBs to Drive
+        run: |
+          set -euo pipefail
+          # Upload only DBs that changed during this run
+          for db in $(find private_repo/data -maxdepth 1 -name "market_*.db" -newer .marker_build_history); do
+            rclone copy "$db" gdrive:market_db/ --drive-acknowledge-abuse --quiet || true
+          done
+
+      - name: Cleanup private code checkout
+        if: always()
+        run: rm -rf private_repo build_history.log
