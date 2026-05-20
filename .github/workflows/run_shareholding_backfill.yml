@@ -32,6 +32,8 @@ jobs:
     steps:
       - name: Checkout PUBLIC runner repo
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Checkout PRIVATE code repo
         uses: actions/checkout@v4
@@ -40,6 +42,7 @@ jobs:
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           path: private_repo
           fetch-depth: 1
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -81,7 +84,7 @@ jobs:
       - name: Marker (upload only modified DBs)
         run: touch .marker_shp
 
-      - name: Run shareholding backfill (quiet-ish)
+      - name: Run shareholding backfill (logs captured)
         working-directory: private_repo
         run: |
           set -euo pipefail
@@ -90,8 +93,11 @@ jobs:
             --end-year "${{ env.END_YEAR }}" \
             --max-minutes "${{ inputs.max_minutes }}" \
             --upload-buffer-min "${{ inputs.upload_buffer_min }}" \
-            > ../shp_backfill.log 2>&1 || (tail -n 200 ../shp_backfill.log && exit 1)
-          tail -n 80 ../shp_backfill.log
+            > ../shp_backfill.log 2>&1
+
+      - name: Show last lines only if failed
+        if: failure()
+        run: tail -n 200 shp_backfill.log || true
 
       - name: Upload modified DBs
         run: |
