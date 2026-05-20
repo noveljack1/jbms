@@ -36,6 +36,8 @@ jobs:
     steps:
       - name: Checkout PUBLIC runner repo
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Checkout PRIVATE code repo
         uses: actions/checkout@v4
@@ -44,6 +46,7 @@ jobs:
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           path: private_repo
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
@@ -60,7 +63,7 @@ jobs:
           ${{ secrets.RCLONE_CONFIG }}
           RCLONE_EOF
 
-      - name: Install dependencies (private repo requirements)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip >/dev/null
           pip install -r private_repo/requirements.txt -q
@@ -69,25 +72,21 @@ jobs:
         run: |
           YEAR=$(TZ='Asia/Kolkata' date +'%Y')
           echo "YEAR=$YEAR" >> $GITHUB_ENV
-          echo "YEAR=$YEAR"
 
       - name: Create data dir (inside private repo)
         run: mkdir -p private_repo/data
 
       - name: Download existing DBs (resume)
         run: |
-          # Minimal logs
           for year in $(seq 1995 ${{ env.YEAR }}); do
             rclone copy "gdrive:market_db/market_${year}.db" private_repo/data/ \
-              --drive-acknowledge-abuse \
-              --quiet 2>/dev/null || true
+              --drive-acknowledge-abuse --quiet 2>/dev/null || true
           done
 
       - name: Marker (upload only modified DBs)
-        run: |
-          touch .marker_build_history
+        run: touch .marker_build_history
 
-      - name: Run build_history.py (quiet-ish)
+      - name: Run build_history.py (logs captured)
         env:
           BUILD_MAX_MINUTES: ${{ inputs.build_max_minutes }}
           BUILD_UPLOAD_BUFFER_MIN: ${{ inputs.upload_buffer_min }}
@@ -97,17 +96,19 @@ jobs:
         working-directory: private_repo
         run: |
           set -euo pipefail
-          python scripts/build_history.py > ../build_history.log 2>&1 || (tail -n 200 ../build_history.log && exit 1)
-          tail -n 80 ../build_history.log
+          python scripts/build_history.py > ../build_history.log 2>&1
+
+      - name: Show last lines only if failed
+        if: failure()
+        run: tail -n 200 build_history.log || true
 
       - name: Upload modified DBs to Drive
         run: |
           set -euo pipefail
-          # Upload only DBs that changed during this run
           for db in $(find private_repo/data -maxdepth 1 -name "market_*.db" -newer .marker_build_history); do
             rclone copy "$db" gdrive:market_db/ --drive-acknowledge-abuse --quiet || true
           done
 
-      - name: Cleanup private code checkout
+      - name: Cleanup
         if: always()
         run: rm -rf private_repo build_history.log
