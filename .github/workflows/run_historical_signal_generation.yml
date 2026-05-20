@@ -32,6 +32,8 @@ jobs:
     steps:
       - name: Checkout PUBLIC runner repo
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Checkout PRIVATE code repo
         uses: actions/checkout@v4
@@ -40,6 +42,7 @@ jobs:
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           path: private_repo
           fetch-depth: 1
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -78,7 +81,7 @@ jobs:
       - name: Marker (upload only modified DBs)
         run: touch .marker_hist_signals
 
-      - name: Run historical_signal_generator.py (quiet-ish)
+      - name: Run historical_signal_generator.py (logs captured)
         working-directory: private_repo
         run: |
           set -euo pipefail
@@ -87,8 +90,11 @@ jobs:
             --upload-buffer-min "${{ inputs.upload_buffer_min }}" \
             --max-symbols "${{ inputs.max_symbols }}" \
             --end-date "${{ inputs.end_date }}" \
-            > ../hist_signals.log 2>&1 || (tail -n 200 ../hist_signals.log && exit 1)
-          tail -n 80 ../hist_signals.log
+            > ../hist_signals.log 2>&1
+
+      - name: Show last lines only if failed
+        if: failure()
+        run: tail -n 200 hist_signals.log || true
 
       - name: Upload modified DBs
         run: |
