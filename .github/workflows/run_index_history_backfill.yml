@@ -1,0 +1,188 @@
+name: Index History Backfill (Full History, Resume-Capable)
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_minutes:
+        description: "Python runtime budget (minutes, <=335 recommended)"
+        required: false
+        default: "335"
+      upload_buffer_min:
+        description: "Minutes reserved for DB uploads"
+        required: false
+        default: "25"
+      force_refetch:
+        description: "1 to re-fetch already stored quarters (slow, use rarely)"
+        required: false
+        default: "0"
+      end_date:
+        description: "End date YYYY-MM-DD (optional, defaults to today IST)"
+        required: false
+        default: ""
+
+jobs:
+  index-backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    env:
+      TZ: Asia/Kolkata
+
+    steps:
+      - name: Checkout PUBLIC runner repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout PRIVATE code repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: private_repo
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install rclone
+        run: curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << 'RCLONE_EOF'
+          ${{ secrets.RCLONE_CONFIG }}
+          RCLONE_EOF
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip >/dev/null
+          pip install -r private_repo/requirements.txt -q
+
+      - name: Resolve year and end_date
+        run: |
+          YEAR=$(TZ='Asia/Kolkata' date +'%Y')
+          echo "YEAR=$YEAR" >> $GITHUB_ENV
+          END_DATE="${{ inputs.end_date }}"
+          if [ -z "$END_DATE" ]; then
+            END_DATE=$(TZ='Asia/Kolkata' date +'%Y-%m-%d')
+          fi
+          echo "END_DATE=$END_DATE" >> $GITHUB_ENV
+
+      - name: Create data dir
+        run: mkdir -p private_repo/data
+
+      - name: Download ALL existing year DBs (to check what is already stored)
+        run: |
+          for year in $(seq 1995 ${{ env.YEAR }}); do
+            rclone copy "gdrive:market_db/market_${year}.db" private_repo/data/ \
+              --drive-acknowledge-abuse --quiet 2>/dev/null || true
+          done
+          FOUND=$(find private_repo/data -maxdepth 1 -name "market_*.db" 2>/dev/null | wc -l)
+          echo "DBs downloaded: $FOUND"
+
+      - name: Marker (upload only modified DBs)
+        run: touch .marker_idx_backfill
+
+      - name: Run full index history backfill (quarterly chunks, resume-capable)
+        working-directory: private_repo
+        env:
+          END_DATE: ${{ env.END_DATE }}
+          MAX_MINUTES: ${{ inputs.max_minutes }}
+          UPLOAD_BUFFER_MIN: ${{ inputs.upload_buffer_min }}
+          FORCE_REFETCH: ${{ inputs.force_refetch }}
+        run: |
+          python - << 'PY'
+          import sys, os
+          sys.path.insert(0, '.')
+          from scripts.fetch_index_history import backfill_index_full_history
+          from config.settings import INDEX_FULL_LIST
+
+          end_date       = os.environ.get("END_DATE", "").strip()
+          max_minutes    = float(os.environ.get("MAX_MINUTES", "300"))
+          upload_buffer  = float(os.environ.get("UPLOAD_BUFFER_MIN", "25"))
+          force_refetch  = os.environ.get("FORCE_REFETCH", "0").strip() == "1"
+
+          summary = backfill_index_full_history(
+              index_list=INDEX_FULL_LIST,
+              end_date=end_date,
+              max_minutes=max_minutes,
+              upload_buffer_min=upload_buffer,
+              delay_sec=0.6,
+              force_refetch=force_refetch,
+          )
+
+          if summary.get("stopped_early"):
+              print("INCOMPLETE: Re-run this workflow to continue.")
+          else:
+              print("COMPLETE: All indices fully backfilled!")
+          PY
+
+      - name: Compute index indicators (all years)
+        working-directory: private_repo
+        env:
+          END_DATE: ${{ env.END_DATE }}
+        run: |
+          python - << 'PY'
+          import sys, os
+          sys.path.insert(0, '.')
+          from scripts.compute_index_indicators import compute_and_store_index_indicators_bulk
+          from config.settings import IST
+          from datetime import datetime
+
+          end_date = os.environ.get("END_DATE", "").strip()
+          if not end_date:
+              end_date = datetime.now(IST).strftime('%Y-%m-%d')
+
+          compute_and_store_index_indicators_bulk(
+              store_from="1995-01-01",
+              store_to=end_date,
+              history_days=900,
+          )
+          print("Index indicators computed for all years.")
+          PY
+
+      - name: Show summary (row counts per year, no raw data)
+        working-directory: private_repo
+        run: |
+          python - << 'PY'
+          import os, sqlite3, glob
+          from config.settings import LOCAL_DATA_DIR
+
+          dbs = sorted(glob.glob(os.path.join(LOCAL_DATA_DIR, "market_*.db")))
+          total_rows = 0
+          for db in dbs:
+              try:
+                  conn = sqlite3.connect(db)
+                  r = conn.execute("SELECT COUNT(*) FROM index_price_data").fetchone()
+                  cnt = int(r[0] or 0) if r else 0
+                  conn.close()
+                  year = os.path.basename(db).replace("market_","").replace(".db","")
+                  if cnt > 0:
+                      print(f"  {year}: {cnt:,} index rows")
+                  total_rows += cnt
+              except Exception:
+                  pass
+          print(f"\nTotal index rows across all DBs: {total_rows:,}")
+          PY
+
+      - name: Upload modified DBs to Google Drive
+        run: |
+          COUNT=0
+          for db in $(find private_repo/data -maxdepth 1 -name "market_*.db" -newer .marker_idx_backfill); do
+            rclone copy "$db" gdrive:market_db/ \
+              --drive-acknowledge-abuse --quiet || true
+            COUNT=$((COUNT+1))
+          done
+          echo "Uploaded: $COUNT DBs"
+
+      - name: Cleanup (remove all private code and data from runner)
+        if: always()
+        run: |
+          rm -rf private_repo
+          rm -f .marker_idx_backfill
+          echo "Cleanup done. No private data on runner."
