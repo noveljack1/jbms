@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       build_max_minutes:
-        description: "Python runtime budget (minutes) (<=320 recommended)"
+        description: "Python runtime budget (minutes) (<=335 recommended)"
         required: false
-        default: "340"
+        default: "335"
       upload_buffer_min:
         description: "Minutes reserved for uploads"
         required: false
