@@ -1,0 +1,146 @@
+name: Daily Market Update
+
+on:
+  schedule:
+    - cron: "30 12 * * 1-5"   # 6:00 PM IST = 12:30 UTC, Mon-Fri
+  workflow_dispatch:
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      TZ: Asia/Kolkata
+
+    steps:
+      - name: Checkout PUBLIC runner repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout PRIVATE code repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: private_repo
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install rclone
+        run: curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << 'RCLONE_EOF'
+          ${{ secrets.RCLONE_CONFIG }}
+          RCLONE_EOF
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip >/dev/null
+          pip install -r private_repo/requirements.txt -q
+
+      - name: Resolve year and DB names
+        run: |
+          YEAR=$(TZ='Asia/Kolkata' date +'%Y')
+          echo "YEAR=$YEAR" >> $GITHUB_ENV
+          echo "DB_NAME=market_${YEAR}.db" >> $GITHUB_ENV
+          echo "PREV_DB=market_$((YEAR-1)).db" >> $GITHUB_ENV
+          echo "PREV2_DB=market_$((YEAR-2)).db" >> $GITHUB_ENV
+
+      - name: Create data dir
+        run: mkdir -p private_repo/data
+
+      - name: Download current + previous DBs
+        run: |
+          for db in "${{ env.DB_NAME }}" "${{ env.PREV_DB }}" "${{ env.PREV2_DB }}"; do
+            rclone copy "gdrive:market_db/${db}" private_repo/data/ \
+              --drive-acknowledge-abuse --quiet 2>/dev/null || true
+          done
+
+      - name: Marker
+        run: touch .marker_daily
+
+      - name: Run daily update
+        working-directory: private_repo
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          python scripts/update_db.py > ../update_db.log 2>&1
+
+      - name: Generate signals + reports
+        working-directory: private_repo
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          python -c "
+          import sys
+          sys.path.insert(0,'.')
+          from datetime import datetime
+          from config.settings import IST, get_local_db_path
+          from scripts.generate_signals import generate_signals
+          from scripts.generate_reports import generate_html_dashboard
+
+          now = datetime.now(IST)
+          db  = get_local_db_path(now.year)
+          generate_signals(now.strftime('%Y-%m-%d'), db)
+          generate_html_dashboard()
+          " >> ../update_db.log 2>&1
+
+      - name: Send Telegram alerts
+        working-directory: private_repo
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+        run: |
+          python -c "
+          import sys; sys.path.insert(0,'.')
+          from scripts.telegram_alert import send_daily_alerts
+          send_daily_alerts()
+          " || true
+
+      - name: Show last lines only if failed
+        if: failure()
+        run: tail -n 200 update_db.log || true
+
+      - name: Upload modified DBs
+        run: |
+          for db in $(find private_repo/data -maxdepth 1 -name "market_*.db" -newer .marker_daily); do
+            rclone copy "$db" gdrive:market_db/ --drive-acknowledge-abuse --quiet || true
+          done
+
+      - name: Send error alert on failure
+        if: failure()
+        working-directory: private_repo
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "
+          import sys; sys.path.insert(0,'.')
+          from scripts.telegram_alert import send_error_alert
+          send_error_alert('Daily update failed.', 'run_daily_update.yml')
+          " || true
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf private_repo update_db.log
