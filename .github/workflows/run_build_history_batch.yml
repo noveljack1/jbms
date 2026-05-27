@@ -6,7 +6,7 @@ on:
       build_max_minutes:
         description: "Python runtime budget (minutes) (<=320 recommended)"
         required: false
-        default: "320"
+        default: "340"
       upload_buffer_min:
         description: "Minutes reserved for uploads"
         required: false
