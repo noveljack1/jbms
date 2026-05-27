@@ -1,0 +1,91 @@
+name: Backfill Queue (Full History Resume)
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_minutes:
+        description: "Runtime budget (minutes, <= 330 recommended)"
+        required: false
+        default: "330"
+      max_symbols:
+        description: "Max symbols to process"
+        required: false
+        default: "50"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    env:
+      TZ: Asia/Kolkata
+
+    steps:
+      - name: Checkout PUBLIC runner repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout PRIVATE code repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: private_repo
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install rclone
+        run: curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << 'RCLONE_EOF'
+          ${{ secrets.RCLONE_CONFIG }}
+          RCLONE_EOF
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip >/dev/null
+          pip install -r private_repo/requirements.txt -q
+
+      - name: Resolve year
+        run: |
+          YEAR=$(TZ='Asia/Kolkata' date +'%Y')
+          echo "YEAR=$YEAR" >> $GITHUB_ENV
+
+      - name: Create data dir
+        run: mkdir -p private_repo/data
+
+      - name: Download existing DBs
+        run: |
+          for year in $(seq 1995 ${{ env.YEAR }}); do
+            rclone copy "gdrive:market_db/market_${year}.db" private_repo/data/ \
+              --drive-acknowledge-abuse --quiet 2>/dev/null || true
+          done
+
+      - name: Marker
+        run: touch .marker_backfill
+
+      - name: Run backfill queue
+        working-directory: private_repo
+        run: |
+          python scripts/run_backfill_queue.py \
+            --max-minutes "${{ inputs.max_minutes }}" \
+            --max-symbols "${{ inputs.max_symbols }}"
+
+      - name: Upload modified DBs
+        run: |
+          for db in $(find private_repo/data -maxdepth 1 -name "market_*.db" -newer .marker_backfill); do
+            rclone copy "$db" gdrive:market_db/ --drive-acknowledge-abuse --quiet || true
+          done
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf private_repo
